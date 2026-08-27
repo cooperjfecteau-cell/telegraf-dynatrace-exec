@@ -110,8 +110,10 @@ class TestOneAgentOutput:
 
         assert points, f"nothing arrived. Raw lines: {receiver.lines}"
         assert any(point.value == pytest.approx(42.5) for point in points), receiver.lines
-        # The plugin applies the configured prefix to the metric key.
-        assert any("unit_test_metric" in point.name for point in points), receiver.lines
+        # The Dynatrace output builds the key as <prefix>.<measurement>.<field>, so the
+        # value parser's field arrives as a trailing ".value". Pinned exactly, because
+        # this is the string someone has to type into a DQL query.
+        assert [point.name for point in points] == ["telegraf.unit_test_metric.value"]
 
     def test_the_default_oneagent_path_is_used(self, tmp_path, telegraf_bin, shell_bin):
         with OneAgentMetricsReceiver(port=ONEAGENT_PORT) as receiver:

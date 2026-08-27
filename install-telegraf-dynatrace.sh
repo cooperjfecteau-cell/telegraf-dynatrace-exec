@@ -853,11 +853,23 @@ require_root() {
     fi
 }
 
+# The Dynatrace output builds the key as <prefix>.<measurement>.<field>, so with the
+# value parser the key carries a trailing ".value". Getting this wrong sends people to a
+# DQL query that quietly returns nothing.
+dynatrace_metric_key() {
+    if [ "$DATA_FORMAT" = "value" ]; then
+        printf '%s.%s.value' "$METRIC_PREFIX" "$METRIC_NAME"
+    else
+        printf '%s.%s.<field>' "$METRIC_PREFIX" "$METRIC_NAME"
+    fi
+}
+
 print_summary() {
     local where
     if [ "$OUTPUT_MODE" = "oneagent" ]; then
-        where="the local OneAgent at $ONEAGENT_URL, as ${METRIC_PREFIX}.${METRIC_NAME}"
+        where="the local OneAgent at $ONEAGENT_URL, as $(dynatrace_metric_key)"
     else
+        # otlp mode renames the field to "gauge", which collapses the name to just this.
         where="$OTLP_ENDPOINT over OTLP/HTTP, as $METRIC_NAME"
     fi
 
@@ -874,10 +886,10 @@ $where
 SUMMARY
 
     if [ "$OUTPUT_MODE" = "oneagent" ]; then
-        cat <<'NEXT'
+        cat <<NEXT
 
 In Dynatrace, find it with:
-  timeseries avg(telegraf.<metric-name>)
+  timeseries avg($(dynatrace_metric_key)), by: {host.name}
 NEXT
     fi
 }

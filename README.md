@@ -61,13 +61,24 @@ full `http(s)://` URL for exactly that reason.
 
 ## What arrives in Dynatrace
 
-`--command 'cat /proc/loadavg | cut -d" " -f1' --metric-name node_load1` gives you a metric
-named `telegraf.node_load1` in `oneagent` mode (the `telegraf` prefix is
-`--metric-prefix`), or `node_load1` in `otlp` mode. Query it:
+`--command 'cat /proc/loadavg | cut -d" " -f1' --metric-name node_load1` gives you:
+
+| Mode | Metric key in Dynatrace |
+|---|---|
+| `oneagent` | `telegraf.node_load1.value` |
+| `otlp` | `node_load1` |
+
+The two differ, and the difference bites. The Dynatrace output builds its key as
+`<prefix>.<measurement>.<field>`, so the field that the `value` parser produces shows up
+as a trailing `.value` — query `telegraf.node_load1` and you get nothing back. The prefix
+is `--metric-prefix`, and the script prints the exact key to query when it finishes.
 
 ```
-timeseries avg(telegraf.node_load1), by: {host.name}
+timeseries avg(telegraf.node_load1.value), by: {host.name}
 ```
+
+With `--data-format json` or `influx`, the last segment is whichever field your command
+emitted instead of `value`.
 
 Every point carries the host and whatever you add with `--tag key=value`.
 
