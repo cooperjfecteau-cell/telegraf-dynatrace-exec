@@ -10,8 +10,10 @@ cache directory if it is not set.
 
 from __future__ import annotations
 
+import json
 import subprocess
 import textwrap
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -266,3 +268,75 @@ def test_the_generated_config_is_accepted_by_telegraf(tmp_path, telegraf_bin, sh
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert "unit_test_metric" in result.stdout, result.stdout + result.stderr
+
+
+class TestFileOutput:
+    """File mode: the command's text on disk, shaped for OneAgent to pick up."""
+
+    def render_and_run(self, tmp_path, shell_bin, telegraf_bin, command, **overrides):
+        log_path = tmp_path / "capture.log"
+        settings = {
+            "COMMAND": command,
+            "METRIC_NAME": "check_output",
+            "OUTPUT_MODE": "file",
+            "DATA_FORMAT": "lines",
+            "LOG_PATH": log_path.as_posix(),
+            "INTERVAL": "1s",
+        }
+        settings.update(overrides)
+        _, config = render(tmp_path, shell_bin, **settings)
+        run_telegraf_once(telegraf_bin, config)
+        if not log_path.exists():
+            raise AssertionError(f"telegraf wrote no log file at {log_path}")
+        return [
+            json.loads(line)
+            for line in log_path.read_text().splitlines()
+            if line.strip()
+        ]
+
+    def test_each_output_line_becomes_its_own_log_record(self, tmp_path, telegraf_bin, shell_bin):
+        # The value parser hands over the whole stdout as one string; grok is what makes
+        # this one record per line, which is the difference between a readable log stream
+        # and a single blob with embedded newlines.
+        records = self.render_and_run(
+            tmp_path, shell_bin, telegraf_bin,
+            "printf '%s\n' 'nginx: worker failed' 'disk /var at 91 pct' 'backup ok'",
+        )
+
+        assert [record["content"] for record in records] == [
+            "nginx: worker failed",
+            "disk /var at 91 pct",
+            "backup ok",
+        ]
+
+    def test_records_use_the_field_names_dynatrace_reads(self, tmp_path, telegraf_bin, shell_bin):
+        records = self.render_and_run(
+            tmp_path, shell_bin, telegraf_bin, "echo hello", EXTRA_TAGS=["env=prod"]
+        )
+        record = records[0]
+
+        # Top level, not nested under "fields": Dynatrace maps content to the log message
+        # and timestamp to the log timestamp only if they are at the root.
+        assert record["content"] == "hello"
+        assert record["log.source"] == "check_output"
+        assert record["env"] == "prod"
+        assert "host.name" in record
+        assert "fields" not in record
+
+    def test_the_timestamp_is_parseable_iso_8601(self, tmp_path, telegraf_bin, shell_bin):
+        records = self.render_and_run(tmp_path, shell_bin, telegraf_bin, "echo hello")
+
+        stamp = records[0]["timestamp"]
+        parsed = datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%S.%f%z")
+        assert parsed.year >= 2024, stamp
+
+    def test_rotation_is_configured_so_the_disk_cannot_fill(self, tmp_path, telegraf_bin, shell_bin):
+        _, config = render(
+            tmp_path, shell_bin,
+            COMMAND="echo hello", METRIC_NAME="check_output", OUTPUT_MODE="file",
+            DATA_FORMAT="lines", LOG_PATH=(tmp_path / "capture.log").as_posix(),
+            LOG_ROTATE_SIZE="5MB", LOG_KEEP=3,
+        )
+        text = config.read_text()
+        assert 'rotation_max_size = "5MB"' in text
+        assert "rotation_max_archives = 3" in text

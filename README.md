@@ -30,19 +30,24 @@ OneAgent's local endpoints on port 14499 are three separate things:
 | `/metrics/ingest` | Dynatrace metric line protocol | Metrics |
 | `/v2/logs/ingest` | Dynatrace log JSON | Logs |
 
-So a metric from a command cannot go through OneAgent *as OTLP*. This script offers the
-two paths that do work:
+So a command's output cannot go through OneAgent *as OTLP*. This script offers the three
+paths that do work:
 
-| `--output` | Goes to | Protocol | Credentials |
+| `--output` | Goes to | Arrives as | Credentials |
 |---|---|---|---|
-| `oneagent` (default) | OneAgent on this host | Dynatrace metric line protocol | None — OneAgent authenticates for you |
-| `otlp` | Any OTLP endpoint you name | OTLP/HTTP + protobuf | API token with `metrics.ingest` |
+| `oneagent` (default) | OneAgent on this host, `/metrics/ingest` | a metric | None — OneAgent authenticates for you |
+| `otlp` | Any OTLP endpoint you name | a metric | API token with `metrics.ingest` |
+| `file` | A log file OneAgent tails | **log records** | None |
 
-**Use `oneagent`** when the host already has a OneAgent. No token to manage or rotate, and
-every data point is enriched with host context so it lands on the right host in Dynatrace.
+**Use `oneagent`** when the host has a OneAgent and your command prints a number. No token
+to manage or rotate, and every data point is enriched with host context.
 
 **Use `otlp`** when you specifically want OTLP: sending straight to a tenant, or into an
 OpenTelemetry Collector you already run.
+
+**Use `file`** when you want the command's *text*, not a number. Telegraf writes each
+output line to a log file and OneAgent ingests it — no token, and it sidesteps the
+traces-only limitation entirely, because it never touches an OTLP endpoint.
 
 ```bash
 sudo ./install-telegraf-dynatrace.sh \
@@ -58,6 +63,53 @@ accepts **HTTP only** (`gRPC is not supported`) and **protobuf only** (`JSON is 
 supported`). Telegraf defaults to gRPC, so pointing it at a bare `host:port` silently
 produces a config that can never deliver. The script refuses an endpoint that is not a
 full `http(s)://` URL for exactly that reason.
+
+## File mode: the command's text as log records
+
+```bash
+sudo ./install-telegraf-dynatrace.sh \
+  --output file \
+  --command 'systemctl --failed --no-legend' \
+  --metric-name failed_units \
+  --interval 5m --tag env=prod
+```
+
+Telegraf writes to `/var/log/telegraf-dynatrace-exec/dynatrace-exec.log`, one JSON record
+per line of command output:
+
+```json
+{"timestamp":"2026-08-27T02:37:11.000Z","content":"nginx.service loaded failed failed","host.name":"web-01","log.source":"failed_units","env":"prod"}
+```
+
+Those field names are deliberate. `content` becomes the log message and `timestamp` the
+log timestamp; the rest become attributes. Telegraf's default JSON nests everything under
+`fields`, which would leave you querying `fields.content` instead of reading a log line, so
+the generated config reshapes it with `json_transformation`.
+
+Each output line is its own record. That takes the line-oriented `grok` parser — the
+`value` parser hands Telegraf the whole stdout as a single string, so a three-line command
+would arrive as one record with `\n` in the middle of it.
+
+### You must add a custom log source, or nothing arrives
+
+**OneAgent does not discover arbitrary log files.** The service will look perfectly
+healthy, the file will fill up, and Dynatrace will show nothing. Add the path once:
+
+> Settings → Collect and capture → Log monitoring → Configure log module → Sources →
+> **New log source rule**, and give it the absolute path the script printed.
+
+The path must be absolute; Dynatrace rejects relative ones. Then:
+
+```
+fetch logs
+| filter log.source == "failed_units"
+| sort timestamp desc
+```
+
+Rotation is on by default — 10 MB, 5 archives, tunable with `--log-rotate-size` and
+`--log-keep`. Rotated files are renamed (`dynatrace-exec.2026-08-26-1787798259.log`), so
+pointing the log source at the exact active path picks up new records without re-reading
+archives. Uninstall leaves the log files alone; delete them yourself if you want them gone.
 
 ## What arrives in Dynatrace
 
@@ -98,6 +150,7 @@ is a test that pins it.
 | `/etc/telegraf/telegraf.d/<name>.conf` | 0640 root:telegraf | The Telegraf input, processor and output |
 | `/etc/telegraf/dynatrace-exec/<name>.env` | 0600 root:root | The API token, only when there is one |
 | `/etc/systemd/system/telegraf.service.d/<name>.conf` | 0644 | Points systemd at that env file |
+| `/var/log/telegraf-dynatrace-exec/<name>.log` | 0755 dir, telegraf-owned | File mode only: the log OneAgent tails |
 
 The command lives in its own file rather than inside the TOML on purpose. Telegraf's exec
 input does not run its command through a shell, so a pipe written into the config would be
@@ -120,7 +173,10 @@ Dynatrace.
 | `--metric-name` | `telegraf_exec` | The name you will query |
 | `--interval` | `60s` | How often to run it |
 | `--timeout` | `30s` | The command is killed after this |
-| `--data-format` | `value` | `value`, `json`, `influx`, `csv`, `logfmt` |
+| `--data-format` | `lines` in file mode, else `value` | `lines`, `value`, `json`, `influx`, `csv`, `logfmt` |
+| `--output` | `oneagent` | `oneagent`, `otlp`, `file` |
+| `--log-path` | `/var/log/telegraf-dynatrace-exec/<config-name>.log` | file mode only |
+| `--log-rotate-size` / `--log-keep` | `10MB` / `5` | file mode only |
 | `--data-type` | `float` | For `value`: what the command prints |
 | `--tag k=v` | — | Extra dimension. Repeatable |
 | `--config-name` | `dynatrace-exec` | Run the script again with a different one to add a second command |
@@ -129,9 +185,8 @@ Dynatrace.
 | `--uninstall` | — | Remove what this script generated |
 
 Your command must print something numeric for `--data-format value`. If it prints
-structured output, use `json` or `influx` instead. If what you actually want is the
-command's **text** in Dynatrace, you want log ingest, not a metric — this script does not
-do that.
+structured output, use `json` or `influx`. If what you want is the command's **text**, use
+`--output file`, which captures it as log records instead.
 
 Run it again with a different `--config-name` to add more commands; each gets its own
 wrapper, config and schedule.
@@ -192,7 +247,9 @@ Linux with `bad interpreter: /bin/bash^M`.
 
 ## Limitations
 
-- Metrics only. For a command's text output as logs, this is the wrong tool.
+- The metric modes need a number. Use `--output file` for text.
+- File mode needs a custom log source configured in Dynatrace once, per path.
+- No OTLP logs: Telegraf's OTLP output plugin emits metrics only, whatever the endpoint.
 - The command must finish. Anything long-running hits `--timeout`; there is no streaming.
 - No interactive commands — no `sudo` password prompts. Use `NOPASSWD` or a dedicated user.
 - `oneagent` mode needs "Enable local HTTP Metric, Log and Event Ingest API" turned on in

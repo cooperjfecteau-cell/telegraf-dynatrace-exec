@@ -98,6 +98,30 @@ jobs:
           sudo journalctl -u telegraf -n 50 --no-pager >&2
           exit 1
 
+      - name: File mode writes Dynatrace-shaped log records
+        run: |
+          sudo ./install-telegraf-dynatrace.sh             --config-name ci-file             --output file             --command 'printf "%s\n" "alpha" "beta"'             --metric-name ci_capture             --interval 10s --tag env=ci
+          for _ in $(seq 1 30); do
+            if sudo test -s /var/log/telegraf-dynatrace-exec/ci-file.log; then break; fi
+            sleep 2
+          done
+          sudo cat /var/log/telegraf-dynatrace-exec/ci-file.log
+          # One record per output line, with the field names Dynatrace reads at the root.
+          sudo python3 - <<'PY'
+          import json, sys
+          lines = [l for l in open("/var/log/telegraf-dynatrace-exec/ci-file.log") if l.strip()]
+          records = [json.loads(l) for l in lines]
+          assert records, "no records written"
+          contents = [r["content"] for r in records]
+          assert "alpha" in contents and "beta" in contents, contents
+          first = records[0]
+          for key in ("content", "timestamp", "log.source", "host.name", "env"):
+              assert key in first, (key, first)
+          assert "fields" not in first, first
+          print("file mode OK:", len(records), "records")
+          PY
+          sudo ./install-telegraf-dynatrace.sh --uninstall --config-name ci-file
+
       - name: Uninstall removes what it created
         run: |
           sudo ./install-telegraf-dynatrace.sh --uninstall

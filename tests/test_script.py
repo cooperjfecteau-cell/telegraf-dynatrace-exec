@@ -106,7 +106,7 @@ class TestArgumentValidation:
             (["--timeout", "abc"], "--timeout must look like"),
             (["--data-format", "yaml"], "--data-format must be one of"),
             (["--data-type", "blob"], "--data-type must be one of"),
-            (["--output", "kafka"], "--output must be oneagent or otlp"),
+            (["--output", "kafka"], "--output must be oneagent, otlp or file"),
             (["--metric-name", "bad name"], "--metric-name may only contain"),
             (["--config-name", "bad/name"], "--config-name may only contain"),
             (["--tag", "novalue"], "--tag expects KEY=VALUE"),
@@ -277,3 +277,77 @@ class TestDryRun:
         assert result.returncode == 0
         assert "SUPERSECRET" not in result.stdout
         assert "redacted" in result.stdout
+
+
+class TestFileOutputMode:
+    def render(self, **settings) -> str:
+        assignments = "\n".join(
+            f"{key}={shlex.quote(str(value))}" for key, value in settings.items()
+        )
+        return call(f"{assignments}\nrender_config")
+
+    def test_file_mode_defaults_to_capturing_lines(self):
+        # Rendering goes through the CLI here, not the globals, because the default is
+        # applied during validation.
+        result = run_script("--dry-run", "--output", "file", "--command", "echo hi")
+        assert result.returncode == 0
+        assert 'data_format = "grok"' in result.stdout
+        assert "%{GREEDYDATA:content}" in result.stdout
+
+    def test_an_explicit_data_format_is_not_overridden(self):
+        result = run_script(
+            "--dry-run", "--output", "file", "--command", "echo 1", "--data-format", "json"
+        )
+        assert result.returncode == 0
+        assert 'data_format = "json"' in result.stdout
+        assert "grok" not in result.stdout
+
+    def test_lines_is_refused_for_the_metric_outputs(self):
+        # It produces a string field, which the metric outputs would silently drop.
+        result = run_script("--dry-run", "--command", "echo 1", "--data-format", "lines")
+        assert result.returncode != 0
+        assert "only works with --output file" in result.stderr
+
+    def test_a_relative_log_path_is_refused(self):
+        result = run_script(
+            "--dry-run", "--output", "file", "--command", "echo 1", "--log-path", "logs/out.log"
+        )
+        assert result.returncode != 0
+        assert "must be an absolute path" in result.stderr
+
+    def test_a_malformed_rotation_size_is_refused(self):
+        result = run_script(
+            "--dry-run", "--output", "file", "--command", "echo 1", "--log-rotate-size", "huge"
+        )
+        assert result.returncode != 0
+        assert "--log-rotate-size must look like" in result.stderr
+
+    def test_the_default_log_path_follows_the_config_name(self):
+        result = run_script(
+            "--dry-run", "--output", "file", "--command", "echo 1", "--config-name", "disk-check"
+        )
+        assert "/var/log/telegraf-dynatrace-exec/disk-check.log" in result.stdout
+
+    def test_the_custom_log_source_step_is_spelled_out(self):
+        # Skipping it means nothing is ingested while everything looks healthy, so the
+        # instruction has to survive refactors.
+        result = run_script("--dry-run", "--output", "file", "--command", "echo 1")
+        assert "custom log source" in result.stdout
+        assert "/var/log/telegraf-dynatrace-exec/dynatrace-exec.log" in result.stdout
+
+    def test_tags_become_top_level_json_attributes(self):
+        config = self.render(
+            COMMAND="echo 1", METRIC_NAME="m", OUTPUT_MODE="file",
+            DATA_FORMAT="lines", LOG_PATH="/var/log/x.log",
+            EXTRA_TAGS="ignored",
+        )
+        assert "json_transformation" in config
+        assert '"content": fields.content' in config
+        assert '"log.source": name' in config
+
+    def test_a_tag_key_that_would_break_the_json_is_refused(self):
+        result = run_script(
+            "--dry-run", "--output", "file", "--command", "echo 1", "--tag", 'bad key=1'
+        )
+        assert result.returncode != 0
+        assert "--tag key may only contain" in result.stderr

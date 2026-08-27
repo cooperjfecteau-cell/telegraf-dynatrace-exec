@@ -42,6 +42,13 @@ OUTPUT_MODE="oneagent"
 ONEAGENT_URL="$ONEAGENT_METRICS_URL"
 ONEAGENT_TOKEN=""
 METRIC_PREFIX="telegraf"
+LOG_DIR="/var/log/telegraf-dynatrace-exec"
+LOG_PATH=""
+LOG_ROTATE_SIZE="10MB"
+LOG_KEEP=5
+# Set when --data-format was given explicitly, so file mode can default it without
+# silently overriding a choice the user made.
+DATA_FORMAT_SET=0
 OTLP_ENDPOINT=""
 OTLP_TOKEN=""
 OTLP_TOKEN_FILE=""
@@ -99,13 +106,24 @@ What to collect
   --metric-name NAME       Metric name in Dynatrace (default: telegraf_exec)
   --interval DURATION      How often to run it (default: 60s)
   --timeout DURATION       Kill the command after this long (default: 30s)
-  --data-format FORMAT     value | json | influx | csv | logfmt (default: value)
+  --data-format FORMAT     lines | value | json | influx | csv | logfmt
+                           (default: lines with --output file, else value)
+                           lines captures the command's text one log record per
+                           output line, and only works with --output file
   --data-type TYPE         For --data-format value: float | integer | string
                            (default: float)
   --tag KEY=VALUE          Extra dimension on every data point. Repeatable.
 
 Where to send it
-  --output MODE            oneagent | otlp (default: oneagent)
+  --output MODE            oneagent | otlp | file (default: oneagent)
+
+  file mode — write the output to a log file for OneAgent to pick up. No token,
+  no metric: the command's text arrives in Dynatrace as log records. You must
+  add the path below as a custom log source in Dynatrace; OneAgent does not
+  discover arbitrary files on its own. The script prints the exact path.
+  --log-path PATH          Default: /var/log/telegraf-dynatrace-exec/<name>.log
+  --log-rotate-size SIZE   Rotate past this size (default: 10MB)
+  --log-keep N             Rotated files to keep (default: 5)
 
   oneagent mode — the local OneAgent metric API, no credentials needed:
   --oneagent-url URL       Default: http://localhost:14499/metrics/ingest
@@ -151,7 +169,10 @@ parse_args() {
             --metric-name)       METRIC_NAME="${2:?--metric-name needs a value}"; shift 2 ;;
             --interval)          INTERVAL="${2:?--interval needs a value}"; shift 2 ;;
             --timeout)           TIMEOUT="${2:?--timeout needs a value}"; shift 2 ;;
-            --data-format)       DATA_FORMAT="${2:?--data-format needs a value}"; shift 2 ;;
+            --data-format)       DATA_FORMAT="${2:?--data-format needs a value}"; DATA_FORMAT_SET=1; shift 2 ;;
+            --log-path)          LOG_PATH="${2:?--log-path needs a value}"; shift 2 ;;
+            --log-rotate-size)   LOG_ROTATE_SIZE="${2:?--log-rotate-size needs a value}"; shift 2 ;;
+            --log-keep)          LOG_KEEP="${2:?--log-keep needs a value}"; shift 2 ;;
             --data-type)         DATA_TYPE="${2:?--data-type needs a value}"; shift 2 ;;
             --tag)               EXTRA_TAGS+=("${2:?--tag needs KEY=VALUE}"); shift 2 ;;
             --output)            OUTPUT_MODE="${2:?--output needs a value}"; shift 2 ;;
@@ -191,10 +212,21 @@ validate_args() {
     is_duration "$INTERVAL" || die "--interval must look like 30s, 5m or 1h, got '$INTERVAL'"
     is_duration "$TIMEOUT"  || die "--timeout must look like 30s, 5m or 1h, got '$TIMEOUT'"
 
+    # File mode is about capturing text, so it defaults to one record per output line.
+    if [ "$OUTPUT_MODE" = "file" ] && [ "$DATA_FORMAT_SET" -eq 0 ]; then
+        DATA_FORMAT="lines"
+    fi
+
     case "$DATA_FORMAT" in
-        value|json|influx|csv|logfmt) ;;
-        *) die "--data-format must be one of value, json, influx, csv, logfmt" ;;
+        lines|value|json|influx|csv|logfmt) ;;
+        *) die "--data-format must be one of lines, value, json, influx, csv, logfmt" ;;
     esac
+
+    # "lines" yields a string field, which is a log record and not a metric. The metric
+    # outputs would drop it, so refuse the combination rather than ingest nothing.
+    if [ "$DATA_FORMAT" = "lines" ] && [ "$OUTPUT_MODE" != "file" ]; then
+        die "--data-format lines only works with --output file; it captures text, not a number"
+    fi
 
     case "$DATA_TYPE" in
         float|integer|string) ;;
@@ -206,11 +238,16 @@ validate_args() {
         *) die "--install-method must be one of auto, repo, package, tarball, none" ;;
     esac
 
-    local tag
+    local tag key
     for tag in ${EXTRA_TAGS+"${EXTRA_TAGS[@]}"}; do
         case "$tag" in
             *=*) ;;
             *) die "--tag expects KEY=VALUE, got '$tag'" ;;
+        esac
+        # Tag keys become bare JSON keys in file mode, so keep them to safe characters.
+        key="${tag%%=*}"
+        case "$key" in
+            *[!A-Za-z0-9_.-]*|"") die "--tag key may only contain letters, digits, dot, dash and underscore, got '$key'" ;;
         esac
     done
 
@@ -241,7 +278,26 @@ validate_args() {
                     ;;
             esac
             ;;
-        *) die "--output must be oneagent or otlp" ;;
+        file)
+            [ -n "$LOG_PATH" ] || LOG_PATH="$LOG_DIR/$CONFIG_NAME.log"
+            case "$LOG_PATH" in
+                /*) ;;
+                *) die "--log-path must be an absolute path; Dynatrace rejects relative custom log source paths too" ;;
+            esac
+            is_size "$LOG_ROTATE_SIZE" || die "--log-rotate-size must look like 10MB or 512KB, got '$LOG_ROTATE_SIZE'"
+            case "$LOG_KEEP" in
+                ""|*[!0-9-]*) die "--log-keep must be a whole number, or -1 to keep everything" ;;
+            esac
+            ;;
+        *) die "--output must be oneagent, otlp or file" ;;
+    esac
+}
+
+is_size() {
+    case "$1" in
+        ""|*[!0-9KMGBkmgb]*) return 1 ;;
+        *[0-9]B|*[0-9]KB|*[0-9]MB|*[0-9]GB|*[0-9]kb|*[0-9]mb|*[0-9]gb) return 0 ;;
+        *) return 1 ;;
     esac
 }
 
@@ -603,9 +659,17 @@ render_input_section() {
     printf '  interval = "%s"\n' "$(toml_escape "$INTERVAL")"
     printf '  timeout = "%s"\n' "$(toml_escape "$TIMEOUT")"
     printf '  name_override = "%s"\n' "$(toml_escape "$METRIC_NAME")"
-    printf '  data_format = "%s"\n' "$(toml_escape "$DATA_FORMAT")"
-    if [ "$DATA_FORMAT" = "value" ]; then
-        printf '  data_type = "%s"\n' "$(toml_escape "$DATA_TYPE")"
+    if [ "$DATA_FORMAT" = "lines" ]; then
+        # The value parser hands the whole stdout over as a single string, newlines and
+        # all, which would arrive in Dynatrace as one log record per run. grok is
+        # line-oriented, so GREEDYDATA gives one record per output line.
+        printf '  data_format = "grok"\n'
+        printf '  grok_patterns = ["%%{GREEDYDATA:content}"]\n'
+    else
+        printf '  data_format = "%s"\n' "$(toml_escape "$DATA_FORMAT")"
+        if [ "$DATA_FORMAT" = "value" ]; then
+            printf '  data_type = "%s"\n' "$(toml_escape "$DATA_TYPE")"
+        fi
     fi
 
     if [ "${#EXTRA_TAGS[@]}" -gt 0 ]; then
@@ -648,9 +712,47 @@ render_processor_section() {
 PROC
 }
 
+# Reshapes Telegraf's default JSON into the field names Dynatrace reads directly:
+# "content" becomes the log message and "timestamp" the log timestamp, instead of both
+# ending up nested under "fields" as attributes nobody wants to query.
+render_json_transformation() {
+    local parts tag key
+    parts='"timestamp": timestamp, "content": fields.content, "host.name": tags.host, "log.source": name'
+    for tag in ${EXTRA_TAGS+"${EXTRA_TAGS[@]}"}; do
+        key="${tag%%=*}"
+        parts="$parts, \"$key\": tags.$key"
+    done
+    printf '{%s}' "$parts"
+}
+
+render_file_output() {
+    cat <<OUT
+[[outputs.file]]
+  ## OneAgent tails this exact file. Rotation renames the old file, so a custom log
+  ## source pointed at this path picks up new records without re-reading archives.
+  files = ["$(toml_escape "$LOG_PATH")"]
+  data_format = "json"
+  rotation_max_size = "$(toml_escape "$LOG_ROTATE_SIZE")"
+  rotation_max_archives = $LOG_KEEP
+  namepass = ["$(toml_escape "$METRIC_NAME")"]
+OUT
+    if [ "$DATA_FORMAT" = "lines" ]; then
+        cat <<OUT
+  json_timestamp_format = "2006-01-02T15:04:05.000Z07:00"
+  json_timestamp_units = "1ms"
+  json_transformation = '$(render_json_transformation)'
+OUT
+    fi
+}
+
 # namepass matters: a file in telegraf.d adds a *global* output, so without it this
 # output would also receive metrics from every other input on the host.
 render_output_section() {
+    if [ "$OUTPUT_MODE" = "file" ]; then
+        render_file_output
+        return 0
+    fi
+
     if [ "$OUTPUT_MODE" = "oneagent" ]; then
         cat <<OUT
 [[outputs.dynatrace]]
@@ -725,6 +827,17 @@ install_files() {
     log "writing the command wrapper and Telegraf configuration"
 
     run mkdir -p "$MANAGED_DIR" "$TELEGRAF_CONF_DIR"
+
+    if [ "$OUTPUT_MODE" = "file" ]; then
+        # Telegraf writes here as $RUN_AS; OneAgent's log module reads it as root, so the
+        # directory has to be traversable rather than private to the service user.
+        run mkdir -p "$(dirname "$LOG_PATH")"
+        if [ "$DRY_RUN" -eq 0 ]; then
+            chown "$RUN_AS:$RUN_AS" "$(dirname "$LOG_PATH")" 2>/dev/null || true
+            chmod 0755 "$(dirname "$LOG_PATH")"
+        fi
+    fi
+
     write_file "$(command_wrapper_path)" 0750 "$(render_command_wrapper)"
     write_file "$(config_path)" 0640 "$(render_config)"
 
@@ -868,6 +981,8 @@ print_summary() {
     local where
     if [ "$OUTPUT_MODE" = "oneagent" ]; then
         where="the local OneAgent at $ONEAGENT_URL, as $(dynatrace_metric_key)"
+    elif [ "$OUTPUT_MODE" = "file" ]; then
+        where="$LOG_PATH, for OneAgent to pick up"
     else
         # otlp mode renames the field to "gauge", which collapses the name to just this.
         where="$OTLP_ENDPOINT over OTLP/HTTP, as $METRIC_NAME"
@@ -890,6 +1005,24 @@ SUMMARY
 
 In Dynatrace, find it with:
   timeseries avg($(dynatrace_metric_key)), by: {host.name}
+NEXT
+    elif [ "$OUTPUT_MODE" = "file" ]; then
+        # Without this step nothing reaches Dynatrace, however healthy the service looks:
+        # OneAgent does not discover arbitrary files.
+        cat <<NEXT
+
+${C_BOLD}One more step, or nothing will be ingested.${C_OFF} OneAgent does not discover
+arbitrary log files. Add this path as a custom log source:
+
+  Settings > Collect and capture > Log monitoring > Configure log module > Sources
+  New log source rule, path:
+
+      $LOG_PATH
+
+Then find the records with:
+  fetch logs
+  | filter log.source == "$METRIC_NAME"
+  | sort timestamp desc
 NEXT
     fi
 }
