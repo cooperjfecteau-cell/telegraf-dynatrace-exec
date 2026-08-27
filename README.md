@@ -14,24 +14,6 @@ That installs the latest Telegraf from InfluxData's repository, writes a command
 and a Telegraf config, validates them by running the command once, and starts the service.
 Nothing else on the host is touched.
 
-## Read this first: OneAgent's OTLP endpoint is traces-only
-
-If you came here to send command output to OneAgent's local **OTLP** endpoint, that is not
-possible, and it is worth knowing why before you start. Dynatrace's documentation is
-explicit:
-
-> Traces-only means OneAgent only accepts tracing information, not metrics or logs.
-
-OneAgent's local endpoints on port 14499 are three separate things:
-
-| Path | Protocol | Accepts |
-|---|---|---|
-| `/otlp/v1/traces` | OTLP/HTTP | Traces only |
-| `/metrics/ingest` | Dynatrace metric line protocol | Metrics |
-| `/v2/logs/ingest` | Dynatrace log JSON | Logs |
-
-So a command's output cannot go through OneAgent *as OTLP*. This script offers the three
-paths that do work:
 
 | `--output` | Goes to | Arrives as | Credentials |
 |---|---|---|---|
