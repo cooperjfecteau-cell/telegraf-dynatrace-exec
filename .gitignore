@@ -1,0 +1,10 @@
+# Test scaffolding
+.venv/
+.telegraf-cache/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+
+# Never commit a real token or a rendered config with one in it
+*.env
+secrets*

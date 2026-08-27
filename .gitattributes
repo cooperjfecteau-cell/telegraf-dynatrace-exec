@@ -1,0 +1,4 @@
+# A shell script with CRLF endings fails on Linux with "bad interpreter: /bin/bash^M".
+# Keep these LF regardless of the checkout platform.
+*.sh text eol=lf
+*.py text eol=lf

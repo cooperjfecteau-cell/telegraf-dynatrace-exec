@@ -1,0 +1,105 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: ShellCheck
+        run: shellcheck --severity=style install-telegraf-dynatrace.sh
+
+      - name: Reject CRLF line endings
+        # A shell script with CRLF fails on Linux with "bad interpreter: /bin/bash^M",
+        # and it is invisible in most diffs.
+        run: |
+          if grep -qU $'\r' install-telegraf-dynatrace.sh; then
+            echo "install-telegraf-dynatrace.sh contains CRLF line endings" >&2
+            exit 1
+          fi
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest opentelemetry-proto
+
+      - name: Test
+        # conftest.py downloads a pinned Telegraf if one is not already present.
+        run: pytest -q
+
+  install-for-real:
+    # The runner is a full VM with systemd, so the installer can be exercised exactly as
+    # it would run on a customer host: real apt repository, real service, real ingest.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Stand in for the OneAgent metric API on port 14499
+        run: |
+          python3 - <<'PY' &
+          from http.server import BaseHTTPRequestHandler, HTTPServer
+          class H(BaseHTTPRequestHandler):
+              def do_POST(self):
+                  body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                  with open("/tmp/oneagent-received.txt", "ab") as f:
+                      f.write(body + b"\n")
+                  payload = b'{"linesOk":1,"linesInvalid":0,"error":null}'
+                  self.send_response(202)
+                  self.send_header("Content-Type", "application/json")
+                  self.send_header("Content-Length", str(len(payload)))
+                  self.end_headers()
+                  self.wfile.write(payload)
+              def log_message(self, *a): pass
+          HTTPServer(("127.0.0.1", 14499), H).serve_forever()
+          PY
+          for _ in $(seq 1 20); do
+            if curl -s -o /dev/null -X POST http://localhost:14499/metrics/ingest; then break; fi
+            sleep 0.5
+          done
+
+      - name: Show the plan first
+        run: ./install-telegraf-dynatrace.sh --dry-run --command 'echo 1' --metric-name ci_check
+
+      - name: Install and start
+        run: |
+          sudo ./install-telegraf-dynatrace.sh \
+            --command 'echo 42' \
+            --metric-name ci_check \
+            --interval 10s \
+            --tag ci=github
+
+      - name: The service is running
+        run: systemctl is-active --quiet telegraf
+
+      - name: The metric actually reached the endpoint
+        run: |
+          for _ in $(seq 1 30); do
+            if grep -q ci_check /tmp/oneagent-received.txt 2>/dev/null; then
+              echo "received:"; cat /tmp/oneagent-received.txt; exit 0
+            fi
+            sleep 2
+          done
+          echo "nothing arrived within 60s" >&2
+          sudo journalctl -u telegraf -n 50 --no-pager >&2
+          exit 1
+
+      - name: Uninstall removes what it created
+        run: |
+          sudo ./install-telegraf-dynatrace.sh --uninstall
+          test ! -f /etc/telegraf/telegraf.d/dynatrace-exec.conf
+          test ! -f /etc/telegraf/dynatrace-exec/dynatrace-exec.sh
